@@ -197,25 +197,133 @@ Because user mappings are marked Non-Global (`PTE_NG`), the ARM64 TLB tags cache
 
 ## 8. Capability-Based Access Control (`kernel/cap.c`)
 
-Every task has a private Capability Space (`cspace[16]`) stored inside its kernel TCB (`task_t`). User-space code never passes raw kernel pointers; instead, it references capability slot numbers (`0..15`).
+### 8.1 What is a Capability? (Capabilities vs. Traditional ACLs)
+
+In traditional monolithic operating systems (like Unix/Linux), security is based on **Access Control Lists (ACLs)** and **Ambient Authority**:
+- Every process runs under a global identity (e.g., `uid = 1000` or `root`).
+- Resources reside in a global namespace (e.g., `/dev/ttyAMA0`, PIDs, sockets).
+- When a process requests an operation, it names the target resource using a global identifier, and the kernel checks whether the process's `uid` has permission.
+- **The Problem (Ambient Authority & The Confused Deputy)**: Because a privileged daemon carries its broad `uid` authority on *every* action it takes, an unprivileged client can trick a privileged service (the "deputy") into misusing its authority on a resource the client shouldn't have access to.
+
+In a **Capability-Based Microkernel** (like seL4, Fuchsia/Zircon, and Helios64), there is **no ambient authority** and **no global namespace** accessible to user space:
+- A **Capability** is an **unforgeable token of authority** that simultaneously:
+  1. **Names** a specific kernel object (an IPC Endpoint, a physical MMIO Device page, a Memory Frame, or a Task), and
+  2. **Encodes the exact access rights** (`READ`, `WRITE`, `SEND`, `RECV`, `GRANT`) the holder is allowed to exercise on that object.
+- If a task does not possess a capability to an object in its private table, **it cannot even name or address that object**—let alone access it.
+
+---
+
+### 8.2 Per-Task Capability Space (`CSpace`) Architecture
+
+In Helios64, capabilities are stored exclusively inside privileged kernel memory (`EL1`-only `.bss`) within each task's Task Control Block (`task->cspace[MAX_CAPS_PER_TASK]` in `include/sched.h`). User-space code in `EL0` **cannot read or modify its `CSpace` directly** (doing so triggers an MMU Data Abort).
+
+Instead, user-space code refers to capabilities using an integer slot index (`cap_slot` $\in [0, 15]$), analogous to an unforgeable hardware-isolated file descriptor:
+
+```mermaid
+flowchart LR
+    subgraph EL0["Unprivileged User Task (EL0, e.g., init_shell PID 3)"]
+        CALL["sys_ipc_call(CAP_SLOT_SYSMON_EP = 2, tag, mr0..3)<br/>Passes integer index x0 = 2"]
+    end
+
+    subgraph EL1["Privileged Kernel TCB: task->cspace[0..15] (EL1-Only Memory)"]
+        S0["Slot 0: CAP_TASK<br/>rights = READ<br/>obj_id = 3 (Self)"]
+        S1["Slot 1: CAP_ENDPOINT<br/>rights = SEND<br/>badge = 0x0300<br/>obj_id = 1 (EP_UART)"]
+        S2["Slot 2: CAP_ENDPOINT<br/>rights = SEND<br/>badge = 0x0301<br/>obj_id = 2 (EP_SYSMON)"]
+        S3["Slot 3..15: CAP_NONE<br/>(Empty)"]
+    end
+
+    subgraph OBJS["Kernel Objects"]
+        EP1["Endpoint 1 (ep:uart_console)"]
+        EP2["Endpoint 2 (ep:sysmon_srv)"]
+    end
+
+    CALL -->|"svc #0 (x0 = 2)"| S2
+    S1 -.-> EP1
+    S2 ==>|"Validated SEND right"| EP2
+```
+
+### 8.3 Capability Structure, Object Types, & Rights Bitmask (`include/cap.h`)
+
+Each entry in `task->cspace[]` is an 16-byte `capability_t` struct:
 
 ```c
 typedef struct capability {
-    uint8_t    type;        /* CAP_NONE, CAP_ENDPOINT, CAP_FRAME, CAP_DEVICE, CAP_TASK */
-    uint8_t    rights;      /* Bitmask: READ | WRITE | SEND | RECV | GRANT */
+    uint8_t    type;        /* Object type (cap_type_t) */
+    uint8_t    rights;      /* Access rights bitmask (CAP_RIGHT_*) */
     uint16_t   badge;       /* Unforgeable 16-bit badge stamped by kernel on IPC */
-    uint32_t   obj_id;      /* Target Endpoint ID or Task ID */
-    uintptr_t  phys_base;   /* Physical base address for CAP_FRAME / CAP_DEVICE */
+    uint32_t   obj_id;      /* Kernel object ID (Endpoint ID, Task ID, or page count) */
+    uintptr_t  phys_base;   /* Physical base address (for CAP_FRAME / CAP_DEVICE) */
 } capability_t;
 ```
 
-### Capability Assignment Table at Boot (`kernel/main.c`)
+#### Capability Object Types (`cap_type_t`)
+1. **`CAP_NONE` (`0`)**: Empty/unallocated capability slot. Any lookup on this slot fails immediately with `EPERM`.
+2. **`CAP_ENDPOINT` (`1`)**: References a kernel synchronous IPC endpoint (`g_endpoints[obj_id]`).
+   - With `CAP_RIGHT_SEND`: Allows the holder to invoke `SYS_IPC_CALL` or `SYS_IPC_SEND` to send messages to the endpoint.
+   - With `CAP_RIGHT_RECV`: Allows the holder (a server) to invoke `SYS_IPC_RECV` or `SYS_IPC_REPLY_RECV` to listen for incoming client messages on the endpoint.
+3. **`CAP_FRAME` (`2`)**: References a physical RAM page frame (`phys_base`) that can be mapped into a virtual address space.
+4. **`CAP_DEVICE` (`3`)**: References a hardware MMIO register page (`phys_base`, such as `0x09000000` for PL011 UART0). Required to perform privileged device operations or map hardware registers into a user-space driver (`uart_srv`).
+5. **`CAP_TASK` (`4`)**: Authority over a Task Control Block (`obj_id = task_id`).
+
+#### Access Rights Bitmask (`uint8_t rights`)
+| Constant | Bit | Meaning |
+| :--- | :--- | :--- |
+| `CAP_RIGHT_READ` | `1 << 0` (`0x01`) | Read state or MMIO registers |
+| `CAP_RIGHT_WRITE` | `1 << 1` (`0x02`) | Modify state or MMIO registers |
+| `CAP_RIGHT_SEND` | `1 << 2` (`0x04`) | Send IPC messages to an endpoint |
+| `CAP_RIGHT_RECV` | `1 << 3` (`0x08`) | Receive IPC messages from an endpoint |
+| `CAP_RIGHT_GRANT` | `1 << 4` (`0x10`) | Delegate/transfer capabilities to another task |
+
+---
+
+### 8.4 Unforgeable Sender Badges (`badge`)
+
+When multiple clients (`sysmon_srv`, `init_shell`, etc.) share `SEND` access to the same server endpoint (such as `EP_ID_UART` or `EP_ID_SYSMON`), how does the server know *which* client sent a message, and what authority that client holds, without trusting a user-supplied PID that a malicious client could spoof?
+
+Helios64 solves this using **L4/seL4 Capability Badges**:
+1. When the kernel grants an endpoint capability to a task via `cap_grant()`, it embeds a 16-bit `badge` inside that specific `capability_t` slot in kernel memory:
+   - `sysmon_srv` (PID 2) gets `EP_ID_UART` with `badge = 0x0200`.
+   - `init_shell` (PID 3) gets `EP_ID_UART` with `badge = 0x0300` and `EP_ID_SYSMON` with `badge = 0x0301`.
+2. When a client calls `SYS_IPC_CALL(cap_slot, tag, mr0..mr3)`, the client **cannot specify the badge**. Instead, `sys_ipc_call_handler()` in `kernel/ipc.c` reads `cap->badge` directly from the client's kernel `CSpace` and stamps a 32-bit hardware-verified token into register `x2` of the receiving server's trap frame:
+   ```c
+   uint64_t badge = ((uint64_t)cap->badge << 16) | (client->id & 0xFFFFU);
+   ```
+3. When `sysmon_srv` wakes up from `SYS_IPC_RECV`, `msg.badge` equals `0x03010003` (`badge = 0x0301`, `PID = 3`), which is guaranteed by the kernel to be unforgeable.
+
+---
+
+### 8.5 Fast Constant-Time Capability Validation (`cap_lookup`)
+
+Every capability-checked system call invokes `cap_lookup()` (`kernel/cap.c`), which validates the slot index, object type, and required rights in **constant $O(1)$ time (just a bounds check, array index, and two bitwise comparisons)**:
+
+```c
+const capability_t *cap_lookup(struct task *t, uint32_t slot,
+                               cap_type_t expected_type, uint8_t required_rights) {
+    if (!t || slot >= MAX_CAPS_PER_TASK) {
+        return NULL;
+    }
+    const capability_t *cap = &t->cspace[slot];
+    if (cap->type != (uint8_t)expected_type) {
+        return NULL;
+    }
+    if ((cap->rights & required_rights) != required_rights) {
+        return NULL;
+    }
+    return cap;
+}
+```
+
+For example:
+- If `init_shell` (PID 3) attempts to call `sys_ipc_recv(CAP_SLOT_UART_EP, &msg)` to eavesdrop on console messages sent by other tasks, `cap_lookup(cur, 1, CAP_ENDPOINT, CAP_RIGHT_RECV)` sees that `init_shell`'s slot 1 only has `CAP_RIGHT_SEND` (`0x04 & 0x08 == 0`) and immediately rejects the call with `EPERM (-3)`.
+- If `init_shell` (PID 3) attempts to call `SYS_DEBUG_CONSOLE` to access the UART hardware directly, `cap_lookup(cur, CAP_SLOT_DEVICE_0, CAP_DEVICE, CAP_RIGHT_READ)` sees `CAP_NONE` in slot 3 and rejects the call with `EPERM (-3)`.
+
+### 8.6 Capability Assignment Matrix at Boot (`kernel/main.c`)
 
 | Task | Slot 0 (`CAP_SLOT_SELF_TASK`) | Slot 1 (`CAP_SLOT_UART_EP`) | Slot 2 (`CAP_SLOT_SYSMON_EP`) | Slot 3 (`CAP_SLOT_DEVICE_0`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **`uart_srv` (PID 1)** | `CAP_TASK` (`R`) | `EP_ID_UART` (`RECV \| SEND`, badge `0x0100`) | *Empty* | `CAP_DEVICE` (`0x09000000`, `RW`) |
-| **`sysmon_srv` (PID 2)** | `CAP_TASK` (`R`) | `EP_ID_UART` (`SEND`, badge `0x0200`) | `EP_ID_SYSMON` (`RECV \| SEND`, badge `0x0201`) | *Empty* |
-| **`init_shell` (PID 3)** | `CAP_TASK` (`R`) | `EP_ID_UART` (`SEND`, badge `0x0300`) | `EP_ID_SYSMON` (`SEND`, badge `0x0301`) | *Empty* |
+| **`uart_srv` (PID 1)** | `CAP_TASK` (`R`, obj `1`) | `CAP_ENDPOINT` (`RECV \| SEND`, badge `0x0100`, obj `EP_ID_UART`) | `CAP_NONE` | `CAP_DEVICE` (`RW`, badge `0x0101`, phys `0x09000000`) |
+| **`sysmon_srv` (PID 2)** | `CAP_TASK` (`R`, obj `2`) | `CAP_ENDPOINT` (`SEND`, badge `0x0200`, obj `EP_ID_UART`) | `CAP_ENDPOINT` (`RECV \| SEND`, badge `0x0201`, obj `EP_ID_SYSMON`) | `CAP_NONE` |
+| **`init_shell` (PID 3)** | `CAP_TASK` (`R`, obj `3`) | `CAP_ENDPOINT` (`SEND`, badge `0x0300`, obj `EP_ID_UART`) | `CAP_ENDPOINT` (`SEND`, badge `0x0301`, obj `EP_ID_SYSMON`) | `CAP_NONE` |
 
 ---
 
