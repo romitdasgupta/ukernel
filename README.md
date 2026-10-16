@@ -2,6 +2,8 @@
 
 **Helios64** is a lightweight, high-performance 64-bit ARMv8-A (`AArch64`) microkernel written from scratch in C and ARM64 assembly. It boots on the QEMU `virt` machine (`cortex-a72`) and implements L4-style synchronous register-based IPC with direct process switching, capability-based access control (`CSpace`), hardware `ASID`-tagged 3-level MMU virtual memory isolation, preemptive scheduling, and isolated user-mode (`EL0`) driver and shell services.
 
+> 📖 **See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep-dive technical reference covering the boot sequence, 3-level MMU page tables, capability CSpace, L4 IPC fastpath, and user-space services.**
+
 ---
 
 ## Features
